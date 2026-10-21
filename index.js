@@ -56,10 +56,25 @@ async function saveToWebsite(data) {
     signal: AbortSignal.timeout(15000)
   });
 
-  const j = await r.json().catch(() => ({}));
+  const body = await r.text();
 
-  if (!r.ok || !j.ok) {
-    throw new Error(j.error || 'Website API request failed');
+let j = {};
+try {
+  j = JSON.parse(body);
+} catch {}
+
+if (!r.ok || !j.ok) {
+  console.error('Website API status:', r.status);
+  console.error('Website API response:', body.slice(0, 1000));
+
+  throw new Error(
+    `Website API failed (HTTP ${r.status}): ${
+      j.error || body.slice(0, 200) || 'Empty response'
+    }`
+  );
+}
+
+return j;
   }
 
   return j;
