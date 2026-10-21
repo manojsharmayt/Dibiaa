@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 
 const express = require('express');
@@ -12,7 +11,9 @@ const {
   ButtonStyle,
   ModalBuilder,
   TextInputBuilder,
-  TextInputStyle
+  TextInputStyle,
+  ChannelType,
+  PermissionFlagsBits
 } = require('discord.js');
 
 const app = express();
@@ -21,89 +22,88 @@ app.use(express.json({ limit: '100kb' }));
 const token = process.env.DISCORD_TOKEN;
 const apiKey = process.env.API_KEY;
 const websiteApi = (process.env.WEBSITE_API_URL || '').trim();
-
 const discordClientId = process.env.DISCORD_CLIENT_ID;
 const discordClientSecret = process.env.DISCORD_CLIENT_SECRET;
 const discordRedirectUri =
   process.env.DISCORD_REDIRECT_URI ||
   'https://dibiaa.free.nf/discord-callback.php';
 
+const ticketCategoryId = (process.env.TICKET_CATEGORY_ID || '').trim();
+const supportRoleId = (process.env.SUPPORT_ROLE_ID || '').trim();
+
+// InfinityFree's free-hosting browser challenge blocks non-browser API requests.
+// Keep panel data in memory when the website asks the bot to publish a panel.
+const panelCache = new Map();
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
   partials: [Partials.Channel]
 });
 
-// Verify requests from the website.
 function authorized(req) {
-  return Boolean(
-    apiKey &&
-    req.get('X-API-Key') &&
-    req.get('X-API-Key') === apiKey
-  );
+  return Boolean(apiKey && req.get('X-API-Key') === apiKey);
 }
 
-// Send data to the website API.
-async function saveToWebsite(data) {
-  if (!websiteApi) {
-    throw new Error('WEBSITE_API_URL missing');
-  }
+function looksLikeSecurityChallenge(body) {
+  const text = String(body || '').toLowerCase();
+  return text.includes('/aes.js') ||
+    text.includes('this site requires javascript') ||
+    text.includes('__test');
+}
 
-  if (!apiKey) {
-    throw new Error('API_KEY missing');
-  }
+async function saveToWebsite(data) {
+  if (!websiteApi) throw new Error('WEBSITE_API_URL missing');
+  if (!apiKey) throw new Error('API_KEY missing');
 
   const response = await fetch(websiteApi, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      'Accept': 'application/json',
       'X-API-Key': apiKey
     },
     body: JSON.stringify(data),
-    signal: AbortSignal.timeout(15000)
+    signal: AbortSignal.timeout(8000)
   });
 
   const body = await response.text();
   let result = {};
-
   try {
     result = JSON.parse(body);
   } catch {
-    // The website response was not JSON.
+    // A security challenge is HTML, not a JSON API response.
   }
 
-  if (!response.ok || !result.ok) {
-    console.error('Website API status:', response.status);
-    console.error('Website API response:', body.slice(0, 1000));
-
+  if (looksLikeSecurityChallenge(body)) {
     throw new Error(
-      `Website API failed (HTTP ${response.status}): ${
-        result.error || body.slice(0, 200) || 'Empty response'
-      }`
+      'InfinityFree security challenge blocked the Render API request. ' +
+      'The request returned /aes.js HTML instead of JSON.'
     );
   }
 
+  if (!response.ok || !result.ok) {
+    throw new Error(
+      `Website API failed (HTTP ${response.status}): ` +
+      `${result.error || body.slice(0, 180) || 'Empty response'}`
+    );
+  }
   return result;
 }
 
-// Health check.
 app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'Dibiaa Hub Discord Bot',
-    botReady: client.isReady()
+    botReady: client.isReady(),
+    cachedPanels: panelCache.size
   });
 });
 
-// Discord OAuth code exchange.
-// The PHP callback must validate OAuth state before calling this endpoint.
+// OAuth code exchange. The PHP callback must validate OAuth state first.
 app.post('/oauth/discord/exchange', async (req, res) => {
   if (!authorized(req)) {
-    return res.status(401).json({
-      ok: false,
-      error: 'Unauthorized'
-    });
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
-
   if (!discordClientId || !discordClientSecret) {
     return res.status(500).json({
       ok: false,
@@ -111,28 +111,17 @@ app.post('/oauth/discord/exchange', async (req, res) => {
     });
   }
 
-  const code =
-    typeof req.body?.code === 'string'
-      ? req.body.code.trim()
-      : '';
-
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
   const redirectUri =
     typeof req.body?.redirect_uri === 'string'
       ? req.body.redirect_uri.trim()
       : '';
 
   if (!code || code.length > 2048) {
-    return res.status(400).json({
-      ok: false,
-      error: 'Missing or invalid authorization code'
-    });
+    return res.status(400).json({ ok: false, error: 'Missing or invalid authorization code' });
   }
-
   if (redirectUri !== discordRedirectUri) {
-    return res.status(400).json({
-      ok: false,
-      error: 'Invalid redirect URI'
-    });
+    return res.status(400).json({ ok: false, error: 'Invalid redirect URI' });
   }
 
   try {
@@ -144,87 +133,58 @@ app.post('/oauth/discord/exchange', async (req, res) => {
       redirect_uri: discordRedirectUri
     });
 
-    const tokenResponse = await fetch(
-      'https://discord.com/api/oauth2/token',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: form,
-        signal: AbortSignal.timeout(15000)
-      }
-    );
-
+    const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form,
+      signal: AbortSignal.timeout(15000)
+    });
     const tokenData = await tokenResponse.json().catch(() => ({}));
 
     if (!tokenResponse.ok || !tokenData.access_token) {
-      console.error(
-        'Discord OAuth token exchange failed. HTTP:',
-        tokenResponse.status
-      );
-
+      console.error('Discord OAuth token exchange failed. HTTP:', tokenResponse.status);
       return res.status(502).json({
         ok: false,
         error: 'Discord authorization failed. Please log in again.'
       });
     }
 
-    const headers = {
-      Authorization: `Bearer ${tokenData.access_token}`
-    };
-
+    const headers = { Authorization: `Bearer ${tokenData.access_token}` };
     const [userResponse, guildResponse] = await Promise.all([
       fetch('https://discord.com/api/v10/users/@me', {
-        headers,
-        signal: AbortSignal.timeout(15000)
+        headers, signal: AbortSignal.timeout(15000)
       }),
       fetch('https://discord.com/api/v10/users/@me/guilds', {
-        headers,
-        signal: AbortSignal.timeout(15000)
+        headers, signal: AbortSignal.timeout(15000)
       })
     ]);
-
     const user = await userResponse.json().catch(() => ({}));
     const guilds = await guildResponse.json().catch(() => []);
 
-    if (
-      !userResponse.ok ||
-      !user.id ||
-      !guildResponse.ok ||
-      !Array.isArray(guilds)
-    ) {
+    if (!userResponse.ok || !user.id || !guildResponse.ok || !Array.isArray(guilds)) {
       return res.status(502).json({
         ok: false,
         error: 'Could not load Discord profile or servers'
       });
     }
 
-    // Keep servers owned by the user or where they have
-    // Manage Server or Administrator permissions.
-    const manageableGuilds = guilds
-      .filter(guild => {
-        try {
-          const permissions = BigInt(guild.permissions || '0');
+    const manageableGuilds = guilds.filter(guild => {
+      try {
+        const permissions = BigInt(guild.permissions || '0');
+        return guild.owner === true ||
+          (permissions & 0x20n) !== 0n ||
+          (permissions & 0x8n) !== 0n;
+      } catch {
+        return false;
+      }
+    }).map(guild => ({
+      id: guild.id,
+      name: guild.name,
+      icon: guild.icon || null,
+      owner: guild.owner === true,
+      permissions: guild.permissions
+    }));
 
-          const isOwner = guild.owner === true;
-          const canManageGuild = (permissions & 0x20n) !== 0n;
-          const isAdministrator = (permissions & 0x8n) !== 0n;
-
-          return isOwner || canManageGuild || isAdministrator;
-        } catch {
-          return false;
-        }
-      })
-      .map(guild => ({
-        id: guild.id,
-        name: guild.name,
-        icon: guild.icon || null,
-        owner: guild.owner === true,
-        permissions: guild.permissions
-      }));
-
-    // Never send Discord access tokens to the website.
     return res.json({
       ok: true,
       user: {
@@ -237,7 +197,6 @@ app.post('/oauth/discord/exchange', async (req, res) => {
     });
   } catch (error) {
     console.error('OAuth exchange error:', error.message);
-
     return res.status(502).json({
       ok: false,
       error: 'Could not contact Discord. Please try again.'
@@ -245,33 +204,28 @@ app.post('/oauth/discord/exchange', async (req, res) => {
   }
 });
 
-// Publish a ticket panel to a Discord channel.
+// Website calls this endpoint to publish a panel. Cache the panel's questions
+// here so the Discord button does not need a Render -> InfinityFree API call.
 app.post('/publish-panel', async (req, res) => {
   if (!authorized(req)) {
-    return res.status(401).json({
-      ok: false,
-      error: 'Unauthorized'
-    });
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
 
   try {
     const {
-      panel_id,
-      guild_id,
-      channel_id,
-      title,
-      description,
-      questions
+      panel_id, guild_id, channel_id, title, description, questions
     } = req.body || {};
 
+    const id = String(panel_id || '');
     if (
-      !panel_id ||
+      !/^\d+$/.test(id) ||
       !guild_id ||
       !channel_id ||
       !title ||
       !Array.isArray(questions) ||
       questions.length < 1 ||
-      questions.length > 5
+      questions.length > 5 ||
+      questions.some(q => typeof q !== 'string' || !q.trim())
     ) {
       return res.status(400).json({
         ok: false,
@@ -280,10 +234,7 @@ app.post('/publish-panel', async (req, res) => {
     }
 
     if (!client.isReady()) {
-      return res.status(503).json({
-        ok: false,
-        error: 'Discord bot is not ready yet.'
-      });
+      return res.status(503).json({ ok: false, error: 'Discord bot is not ready yet.' });
     }
 
     const guild = await client.guilds.fetch(String(guild_id));
@@ -296,45 +247,43 @@ app.post('/publish-panel', async (req, res) => {
       });
     }
 
+    const safePanel = {
+      id,
+      guild_id: String(guild_id),
+      title: String(title).slice(0, 256),
+      description: String(description || 'Click below to open a ticket.').slice(0, 4000),
+      questions: questions.map(q => String(q).trim().slice(0, 200))
+    };
+
     const embed = new EmbedBuilder()
-      .setTitle(String(title).slice(0, 256))
-      .setDescription(
-        String(
-          description || 'Click below to open a ticket.'
-        ).slice(0, 4000)
-      )
+      .setTitle(safePanel.title)
+      .setDescription(safePanel.description)
       .setColor(0xe11d48)
-      .setFooter({
-        text: 'Dibiaa Hub • Ticket Panel'
-      });
+      .setFooter({ text: 'Dibiaa Hub • Ticket Panel' });
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId('dh_open:' + String(panel_id))
+        .setCustomId('dh_open:' + id)
         .setLabel('Create Ticket')
         .setStyle(ButtonStyle.Danger)
     );
 
-    const message = await channel.send({
-      embeds: [embed],
-      components: [row]
-    });
+    const message = await channel.send({ embeds: [embed], components: [row] });
+    panelCache.set(id, safePanel);
 
-    // Record the published message in the website database.
-    await saveToWebsite({
-      action: 'panel_published',
-      panel_id,
-      message_id: message.id
-    });
+    // Do not call the InfinityFree API from Render here. The website already
+    // saved the panel before calling /publish-panel; this avoids the false
+    // "publish failed" message caused by InfinityFree's /aes.js challenge.
+    console.log(`Panel ${id} published and cached. Discord message: ${message.id}`);
 
     return res.json({
       ok: true,
       message_id: message.id,
-      channel_id: channel.id
+      channel_id: channel.id,
+      note: 'Panel data cached in bot memory. Re-publish after a bot restart if needed.'
     });
   } catch (error) {
     console.error('Panel publish error:', error.message);
-
     return res.status(500).json({
       ok: false,
       error: error.message || 'Panel publish failed'
@@ -342,152 +291,240 @@ app.post('/publish-panel', async (req, res) => {
   }
 });
 
-// Handle ticket buttons and submitted forms.
+async function createPrivateTicketChannel(interaction, panel, description) {
+  const guild = interaction.guild;
+  if (!guild) throw new Error('Tickets can only be opened inside a server.');
+
+  const member = interaction.member;
+  const username = (interaction.user.username || 'user')
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 18) || 'user';
+
+  const baseName = `ticket-${username}`.slice(0, 90);
+  const overwrites = [
+    {
+      id: guild.id,
+      deny: [PermissionFlagsBits.ViewChannel]
+    },
+    {
+      id: interaction.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.AttachFiles,
+        PermissionFlagsBits.EmbedLinks
+      ]
+    }
+  ];
+
+  if (client.user) {
+    overwrites.push({
+      id: client.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.ManageChannels,
+        PermissionFlagsBits.EmbedLinks
+      ]
+    });
+  }
+
+  if (supportRoleId && /^\d+$/.test(supportRoleId)) {
+    overwrites.push({
+      id: supportRoleId,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.AttachFiles
+      ]
+    });
+  }
+
+  const options = {
+    name: baseName,
+    type: ChannelType.GuildText,
+    topic: `Dibiaa ticket | User ID: ${interaction.user.id} | Panel: ${panel.id}`,
+    permissionOverwrites: overwrites
+  };
+
+  if (ticketCategoryId && /^\d+$/.test(ticketCategoryId)) {
+    options.parent = ticketCategoryId;
+  }
+
+  const channel = await guild.channels.create(options);
+  const embed = new EmbedBuilder()
+    .setTitle(String(panel.title || 'Support Ticket').slice(0, 256))
+    .setDescription(description.slice(0, 4000))
+    .setColor(0xe11d48)
+    .addFields(
+      { name: 'Opened by', value: `<@${interaction.user.id}>`, inline: true },
+      { name: 'Panel ID', value: String(panel.id), inline: true }
+    )
+    .setTimestamp();
+
+  const closeRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('dh_close:' + channel.id)
+      .setLabel('Close Ticket')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  await channel.send({
+    content: supportRoleId ? `<@&${supportRoleId}> <@${interaction.user.id}>` : `<@${interaction.user.id}>`,
+    embeds: [embed],
+    components: [closeRow],
+    allowedMentions: {
+      users: [interaction.user.id],
+      roles: supportRoleId ? [supportRoleId] : []
+    }
+  });
+
+  return channel;
+}
+
 client.on('interactionCreate', async interaction => {
   try {
-    // User clicked Create Ticket.
-    if (
-      interaction.isButton() &&
-      interaction.customId.startsWith('dh_open:')
-    ) {
-      const panelId = Number(interaction.customId.slice(8));
+    if (interaction.isButton() && interaction.customId.startsWith('dh_open:')) {
+      const panelId = interaction.customId.slice('dh_open:'.length);
+      let panel = panelCache.get(panelId);
 
-      const data = await saveToWebsite({
-        action: 'panel_get',
-        panel_id: panelId
-      });
+      // Fallback is useful only if the website API is reachable. On InfinityFree
+      // free hosting this can return the browser-security HTML challenge.
+      if (!panel) {
+        try {
+          const data = await saveToWebsite({ action: 'panel_get', panel_id: Number(panelId) });
+          if (data.panel) {
+            panel = {
+              id: panelId,
+              guild_id: String(data.panel.guild_id || interaction.guildId),
+              title: String(data.panel.title || 'Support Ticket'),
+              description: String(data.panel.description || ''),
+              questions: Array.isArray(data.panel.questions) ? data.panel.questions : []
+            };
+            panelCache.set(panelId, panel);
+          }
+        } catch (error) {
+          console.error('Panel lookup failed:', error.message);
+        }
+      }
 
-      if (
-        !data.panel ||
-        !Array.isArray(data.panel.questions) ||
-        data.panel.questions.length < 1
-      ) {
+      if (!panel || !Array.isArray(panel.questions) ||
+          panel.questions.length < 1 || panel.questions.length > 5) {
         await interaction.reply({
-          content: 'This ticket panel is not configured correctly.',
+          content: 'This panel is not loaded by the bot. Please ask an admin to publish the panel again.',
           ephemeral: true
         });
         return;
       }
-
-      const panel = {
-        t: String(data.panel.title || 'Support Ticket'),
-        q: data.panel.questions.map(question => String(question))
-      };
-
-      if (panel.q.length > 5) {
-        await interaction.reply({
-          content: 'This ticket panel has too many questions.',
-          ephemeral: true
-        });
-        return;
-      }
-
-      const modalPayload = Buffer
-        .from(JSON.stringify(panel))
-        .toString('base64url');
 
       const modal = new ModalBuilder()
-        .setCustomId('dh_submit:' + modalPayload)
-        .setTitle(panel.t.slice(0, 45));
+        .setCustomId('dh_submit:' + panelId)
+        .setTitle(String(panel.title || 'Support Ticket').slice(0, 45));
 
-      for (let n = 0; n < panel.q.length; n++) {
-        const question = panel.q[n];
-
+      panel.questions.forEach((question, index) => {
+        const q = String(question || `Question ${index + 1}`);
         const input = new TextInputBuilder()
-          .setCustomId('q' + n)
-          .setLabel(question.slice(0, 45))
-          .setStyle(
-            n === panel.q.length - 1 && question.length > 70
-              ? TextInputStyle.Paragraph
-              : TextInputStyle.Short
-          )
+          .setCustomId('q' + index)
+          .setLabel(q.slice(0, 45))
+          .setStyle(q.length > 70 ? TextInputStyle.Paragraph : TextInputStyle.Short)
           .setRequired(true)
           .setMaxLength(1000);
 
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(input)
-        );
-      }
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+      });
 
       await interaction.showModal(modal);
       return;
     }
 
-    // User submitted the ticket form.
-    if (
-      interaction.isModalSubmit() &&
-      interaction.customId.startsWith('dh_submit:')
-    ) {
-      let panel;
+    if (interaction.isButton() && interaction.customId.startsWith('dh_close:')) {
+      const channel = interaction.channel;
+      if (!channel || !channel.isTextBased()) {
+        await interaction.reply({ content: 'Ticket channel not found.', ephemeral: true });
+        return;
+      }
 
+      const canClose = interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels) ||
+        interaction.user.id === channel.topic?.match(/User ID: (\d+)/)?.[1];
+
+      if (!canClose) {
+        await interaction.reply({
+          content: 'Only the ticket owner or a moderator can close this ticket.',
+          ephemeral: true
+        });
+        return;
+      }
+
+      await interaction.reply({ content: 'Ticket will be closed in 5 seconds.' });
+      setTimeout(() => channel.delete('Ticket closed').catch(err => {
+        console.error('Could not delete ticket channel:', err.message);
+      }), 5000);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('dh_submit:')) {
+      const panelId = interaction.customId.slice('dh_submit:'.length);
+      const panel = panelCache.get(panelId);
+
+      if (!panel) {
+        await interaction.reply({
+          content: 'This panel is no longer loaded. Please ask an admin to publish it again.',
+          ephemeral: true
+        });
+        return;
+      }
+
+      const description = panel.questions.map((question, index) => {
+        const answer = interaction.fields.getTextInputValue('q' + index);
+        return `**${question}**\n${answer}`;
+      }).join('\n\n');
+
+      await interaction.deferReply({ ephemeral: true });
+
+      let ticketChannel;
       try {
-        const encoded = interaction.customId.slice(10);
-        panel = JSON.parse(
-          Buffer.from(encoded, 'base64url').toString('utf8')
+        ticketChannel = await createPrivateTicketChannel(interaction, panel, description);
+      } catch (error) {
+        console.error('Ticket channel creation failed:', error.message);
+        await interaction.editReply(
+          'Ticket channel create nahi ho paya. Bot ko Manage Channels permission aur category/role settings check karvao.'
         );
-      } catch {
-        await interaction.reply({
-          content: 'Invalid ticket form. Please open the ticket panel again.',
-          ephemeral: true
-        });
         return;
       }
 
-      if (!Array.isArray(panel.q) || panel.q.length < 1 || panel.q.length > 5) {
-        await interaction.reply({
-          content: 'Invalid ticket questions. Please contact an admin.',
-          ephemeral: true
-        });
-        return;
-      }
-
-      const description = panel.q
-        .map((question, index) => {
-          const answer = interaction.fields.getTextInputValue('q' + index);
-          return '**' + question + '**\n' + answer;
-        })
-        .join('\n\n');
-
-      await interaction.reply({
-        content: 'Ticket request received. Saving to Dibiaa Hub…',
-        ephemeral: true
-      });
-
-      let saved;
-
+      // Best-effort website DB sync. InfinityFree's free-hosting security challenge
+      // blocks server-to-server API calls, so Discord ticket creation must not fail
+      // just because the website API is unreachable.
+      let databaseSaved = false;
       try {
-        saved = await saveToWebsite({
+        await saveToWebsite({
           action: 'ticket_create',
-          title: String(panel.t || 'Support Ticket'),
+          title: String(panel.title || 'Support Ticket'),
           description,
           discord_user_id: interaction.user.id,
-          discord_channel_id: interaction.channelId
+          discord_channel_id: ticketChannel.id
         });
+        databaseSaved = true;
       } catch (error) {
-        console.error('Ticket database save failed:', error.message);
-
-        await interaction.followUp({
-          content: 'The form was received, but saving failed. Please contact an admin.',
-          ephemeral: true
-        });
-        return;
+        console.error('Ticket created in Discord, but website DB sync failed:', error.message);
       }
 
-      await interaction.followUp({
-        content: 'Ticket saved: **' +
-          String(saved.ticket_code || 'Created') +
-          '**. Staff will follow up in this server.',
-        ephemeral: true
-      });
+      const syncMessage = databaseSaved
+        ? 'Ticket channel create ho gaya aur website database mein save bhi ho gaya.'
+        : 'Ticket channel create ho gaya. Note: InfinityFree security protection ki wajah se website database sync nahi hua; ticket channel Discord mein available hai.';
+
+      await interaction.editReply(`${syncMessage}\nChannel: <#${ticketChannel.id}>`);
+      return;
     }
   } catch (error) {
     console.error('Interaction error:', error.message);
-
-    if (
-      interaction.isRepliable() &&
-      !interaction.replied &&
-      !interaction.deferred
-    ) {
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
       await interaction.reply({
         content: 'Something went wrong. Please try again or contact an admin.',
         ephemeral: true
@@ -496,19 +533,15 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-// Discord bot ready event.
 client.once('clientReady', () => {
   console.log(`Dibiaa Hub bot online as ${client.user.tag}`);
 });
 
-// Start the Render web service.
 const port = Number(process.env.PORT || 3000);
-
 app.listen(port, '0.0.0.0', () => {
   console.log('Bot API listening on port ' + port);
 });
 
-// Log in to Discord.
 if (!token) {
   console.error('DISCORD_TOKEN is missing');
 } else {
