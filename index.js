@@ -99,6 +99,55 @@ app.get('/', (req, res) => {
   });
 });
 
+// Ticket dashboard endpoint: PHP requests this from the browser-facing website,
+// then stores the returned ticket rows in its own MySQL database.
+app.get('/tickets/list', async (req, res) => {
+  if (!authorized(req)) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+  const guildId = String(req.query.guild_id || '');
+  if (!/^\d{15,22}$/.test(guildId)) {
+    return res.status(400).json({ ok: false, error: 'Valid guild_id required' });
+  }
+  try {
+    const guild = await client.guilds.fetch(guildId);
+    const channels = await guild.channels.fetch();
+    const tickets = [];
+    for (const channel of channels.values()) {
+      if (!channel || !channel.isTextBased() || !channel.topic ||
+          !channel.topic.includes('Dibiaa ticket | User ID:')) continue;
+      const userMatch = channel.topic.match(/User ID:\s*(\d+)/);
+      if (!userMatch) continue;
+      let messageDescription = '';
+      let embedTitle = channel.name || 'Discord Ticket';
+      try {
+        const messages = await channel.messages.fetch({ limit: 25 });
+        const botMessage = messages.find(m => m.author.id === client.user.id && m.embeds.length);
+        if (botMessage && botMessage.embeds[0]) {
+          const embed = botMessage.embeds[0];
+          embedTitle = embed.title || embedTitle;
+          messageDescription = embed.description || '';
+        }
+      } catch (err) {
+        console.error('Ticket channel read failed:', channel.id, err.message);
+      }
+      tickets.push({
+        title: embedTitle,
+        description: messageDescription || 'Ticket created in Discord.',
+        discord_user_id: userMatch[1],
+        discord_channel_id: channel.id,
+        guild_id: guildId,
+        status: channel.name.startsWith('closed-') ? 'closed' : 'open',
+        created_at: channel.createdAt.toISOString().slice(0, 19).replace('T', ' ')
+      });
+    }
+    return res.json({ ok: true, tickets });
+  } catch (error) {
+    console.error('Ticket list error:', error.message);
+    return res.status(500).json({ ok: false, error: 'Could not load tickets from Discord.' });
+  }
+});
+
 // OAuth code exchange. The PHP callback must validate OAuth state first.
 app.post('/oauth/discord/exchange', async (req, res) => {
   if (!authorized(req)) {
@@ -461,10 +510,23 @@ client.on('interactionCreate', async interaction => {
         return;
       }
 
-      await interaction.reply({ content: 'Ticket will be closed in 5 seconds.' });
-      setTimeout(() => channel.delete('Ticket closed').catch(err => {
-        console.error('Could not delete ticket channel:', err.message);
-      }), 5000);
+      await interaction.deferReply({ ephemeral: false });
+      try {
+        const topicUser = channel.topic?.match(/User ID: (\d+)/)?.[1];
+        if (topicUser) {
+          await channel.permissionOverwrites.edit(topicUser, {
+            SendMessages: false,
+            AddReactions: false
+          }).catch(() => {});
+        }
+        const oldName = channel.name.replace(/^closed-/, '');
+        const closedName = ('closed-' + oldName).slice(0, 100);
+        await channel.setName(closedName, 'Ticket closed; preserving transcript and dashboard record');
+        await interaction.editReply('Ticket closed and archived. Transcript channel has been preserved.');
+      } catch (error) {
+        console.error('Ticket archive failed:', error.message);
+        await interaction.editReply('Ticket close nahi ho paya. Bot ki Manage Channels permission check karo.');
+      }
       return;
     }
 
