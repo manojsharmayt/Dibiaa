@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const express = require('express');
+const { deflateRawSync, inflateRawSync } = require('node:zlib');
 const {
   Client,
   GatewayIntentBits,
@@ -148,6 +149,25 @@ app.get('/tickets/list', async (req, res) => {
   }
 });
 
+// Channel and role choices for the panel builder. Data comes from the connected Discord server.
+app.get('/guilds/:guildId/channels', async (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  const guildId = String(req.params.guildId || '');
+  if (!/^\d{15,22}$/.test(guildId)) return res.status(400).json({ ok: false, error: 'Valid guild ID required' });
+  try {
+    const guild = await client.guilds.fetch(guildId);
+    const [channels, roles] = await Promise.all([guild.channels.fetch(), guild.roles.fetch().catch(() => null)]);
+    return res.json({
+      ok: true,
+      channels: [...channels.values()].filter(c => c && [ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildCategory].includes(c.type)).map(c => ({ id: c.id, name: c.name, type: c.type, parent_id: c.parentId || null })),
+      roles: roles ? [...roles.values()].filter(r => !r.managed && r.id !== guild.id).map(r => ({ id: r.id, name: r.name, position: r.position })).sort((a,b) => b.position-a.position) : []
+    });
+  } catch (error) {
+    console.error('Guild channel lookup failed:', error.message);
+    return res.status(502).json({ ok: false, error: 'Could not load channels. Check bot membership and View Channels permission.' });
+  }
+});
+
 // OAuth code exchange. The PHP callback must validate OAuth state first.
 app.post('/oauth/discord/exchange', async (req, res) => {
   if (!authorized(req)) {
@@ -262,7 +282,7 @@ app.post('/publish-panel', async (req, res) => {
 
   try {
     const {
-      panel_id, guild_id, channel_id, title, description, questions
+      panel_id, guild_id, channel_id, title, description, questions, settings = {}
     } = req.body || {};
 
     const id = String(panel_id || '');
@@ -296,26 +316,29 @@ app.post('/publish-panel', async (req, res) => {
       });
     }
 
+    const safeSettings = settings && typeof settings === 'object' ? settings : {};
     const safePanel = {
-      id,
-      guild_id: String(guild_id),
+      id, guild_id: String(guild_id),
       title: String(title).slice(0, 256),
       description: String(description || 'Click below to open a ticket.').slice(0, 4000),
-      questions: questions.map(q => String(q).trim().slice(0, 200))
+      questions: questions.map(q => String(q).trim().slice(0, 200)),
+      settings: safeSettings
     };
-
+    const colourText = /^#[0-9a-fA-F]{6}$/.test(String(safeSettings.panel_colour || '')) ? String(safeSettings.panel_colour) : '#e11d48';
+    const packed = deflateRawSync(Buffer.from(JSON.stringify(safePanel))).toString('base64url');
+    const footerText = ('Dibiaa Hub • Ticket Panel • DH1:' + packed).slice(0, 2048);
     const embed = new EmbedBuilder()
       .setTitle(safePanel.title)
       .setDescription(safePanel.description)
-      .setColor(0xe11d48)
-      .setFooter({ text: 'Dibiaa Hub • Ticket Panel' });
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('dh_open:' + id)
-        .setLabel('Create Ticket')
-        .setStyle(ButtonStyle.Danger)
-    );
+      .setColor(colourText)
+      .setFooter({ text: footerText });
+    if (/^https:\/\//i.test(String(safeSettings.thumbnail_url || ''))) embed.setThumbnail(String(safeSettings.thumbnail_url).slice(0, 500));
+    if (/^https:\/\//i.test(String(safeSettings.image_url || ''))) embed.setImage(String(safeSettings.image_url).slice(0, 500));
+    const styleMap = { Primary: ButtonStyle.Primary, Secondary: ButtonStyle.Secondary, Success: ButtonStyle.Success, Danger: ButtonStyle.Danger };
+    const button = new ButtonBuilder().setCustomId('dh_open:' + id).setLabel(String(safeSettings.button_text || 'Open Ticket').slice(0, 80)).setStyle(styleMap[safeSettings.button_colour] || ButtonStyle.Danger);
+    const emoji = String(safeSettings.button_emoji || '').trim();
+    if (emoji && emoji.length <= 20) { try { button.setEmoji(emoji); } catch {} }
+    const row = new ActionRowBuilder().addComponents(button);
 
     const message = await channel.send({ embeds: [embed], components: [row] });
     panelCache.set(id, safePanel);
@@ -352,7 +375,8 @@ async function createPrivateTicketChannel(interaction, panel, description) {
     .replace(/^-|-$/g, '')
     .slice(0, 18) || 'user';
 
-  const baseName = `ticket-${username}`.slice(0, 90);
+  const scheme = String(panel.settings?.naming_scheme || 'ticket-{username}');
+  const baseName = scheme.replaceAll('{username}', username).replaceAll('{id}', String(Date.now()).slice(-6)).replace(/[^a-z0-9-]/gi, '-').replace(/-+/g, '-').slice(0, 90) || `ticket-${username}`;
   const overwrites = [
     {
       id: guild.id,
@@ -364,8 +388,8 @@ async function createPrivateTicketChannel(interaction, panel, description) {
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.ReadMessageHistory,
-        PermissionFlagsBits.AttachFiles,
-        PermissionFlagsBits.EmbedLinks
+        ...(panel.settings?.permission_attachments === 0 ? [] : [PermissionFlagsBits.AttachFiles]),
+        ...(panel.settings?.permission_embeds === 0 ? [] : [PermissionFlagsBits.EmbedLinks])
       ]
     }
   ];
@@ -383,9 +407,10 @@ async function createPrivateTicketChannel(interaction, panel, description) {
     });
   }
 
-  if (supportRoleId && /^\d+$/.test(supportRoleId)) {
+  const panelSupportRole = String(panel.settings?.support_role_id || supportRoleId || '');
+  if (panelSupportRole && /^\d+$/.test(panelSupportRole)) {
     overwrites.push({
-      id: supportRoleId,
+      id: panelSupportRole,
       allow: [
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.SendMessages,
@@ -402,9 +427,8 @@ async function createPrivateTicketChannel(interaction, panel, description) {
     permissionOverwrites: overwrites
   };
 
-  if (ticketCategoryId && /^\d+$/.test(ticketCategoryId)) {
-    options.parent = ticketCategoryId;
-  }
+  const panelCategoryId = String(panel.settings?.ticket_category_id || ticketCategoryId || '');
+  if (panelCategoryId && /^\d+$/.test(panelCategoryId)) options.parent = panelCategoryId;
 
   const channel = await guild.channels.create(options);
   const embed = new EmbedBuilder()
@@ -423,14 +447,15 @@ async function createPrivateTicketChannel(interaction, panel, description) {
       .setLabel('Close Ticket')
       .setStyle(ButtonStyle.Secondary)
   );
+  const ticketComponents = (panel.settings?.hide_close_button || panel.settings?.allow_user_close === 0) ? [] : [closeRow];
 
   await channel.send({
-    content: supportRoleId ? `<@&${supportRoleId}> <@${interaction.user.id}>` : `<@${interaction.user.id}>`,
+    content: (panel.settings?.mention_support && panel.settings?.support_role_id) ? `<@&${panel.settings.support_role_id}> <@${interaction.user.id}>` : (supportRoleId && !panel.settings ? `<@&${supportRoleId}> <@${interaction.user.id}>` : `<@${interaction.user.id}>`),
     embeds: [embed],
-    components: [closeRow],
+    components: ticketComponents,
     allowedMentions: {
       users: [interaction.user.id],
-      roles: supportRoleId ? [supportRoleId] : []
+      roles: (panel.settings?.mention_support && panel.settings?.support_role_id) ? [panel.settings.support_role_id] : (supportRoleId && !panel.settings ? [supportRoleId] : [])
     }
   });
 
@@ -443,23 +468,21 @@ client.on('interactionCreate', async interaction => {
       const panelId = interaction.customId.slice('dh_open:'.length);
       let panel = panelCache.get(panelId);
 
-      // Fallback is useful only if the website API is reachable. On InfinityFree
-      // free hosting this can return the browser-security HTML challenge.
+      // Recover saved panel settings from the Discord message itself after a Render restart.
       if (!panel) {
         try {
-          const data = await saveToWebsite({ action: 'panel_get', panel_id: Number(panelId) });
-          if (data.panel) {
-            panel = {
-              id: panelId,
-              guild_id: String(data.panel.guild_id || interaction.guildId),
-              title: String(data.panel.title || 'Support Ticket'),
-              description: String(data.panel.description || ''),
-              questions: Array.isArray(data.panel.questions) ? data.panel.questions : []
-            };
-            panelCache.set(panelId, panel);
+          const message = await interaction.message.fetch();
+          const footer = message.embeds?.[0]?.footer?.text || '';
+          const match = footer.match(/DH1:([A-Za-z0-9_-]+)/);
+          if (match) {
+            const recovered = JSON.parse(inflateRawSync(Buffer.from(match[1], 'base64url')).toString('utf8'));
+            if (String(recovered.id) === panelId && Array.isArray(recovered.questions)) {
+              panel = recovered;
+              panelCache.set(panelId, panel);
+            }
           }
         } catch (error) {
-          console.error('Panel lookup failed:', error.message);
+          console.error('Panel recovery failed:', error.message);
         }
       }
 
